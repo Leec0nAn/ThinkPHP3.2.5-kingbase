@@ -1,0 +1,37 @@
+{
+    "name": "kingbase/thinkphp32-kingbase",
+    "description": "KingbaseES database driver for ThinkPHP 3.2.5 using PDO_KDB",
+    "type": "library",
+    "keywords": [
+        "thinkphp",
+        "kingbasees",
+        "kes",
+        "pdo_kdb",
+        "database"
+    ],
+    "license": "Apache-2.0",
+    "authors": [
+        {
+            "name": "ThinkPHP KingbaseES Adapter Contributors"
+        }
+    ],
+    "require": {
+        "php": ">=5.6 <7.0",
+        "ext-pdo": "*",
+        "ext-pdo_kdb": "*"
+    },
+    "suggest": {
+        "topthink/thinkphp": "ThinkPHP 3.2.5 is the supported framework version"
+    },
+    "autoload": {
+        "classmap": [
+            "src/"
+        ]
+    },
+    "bin": [
+        "bin/kingbase-doctor"
+    ],
+    "config": {
+        "sort-packages": true
+    }
+}

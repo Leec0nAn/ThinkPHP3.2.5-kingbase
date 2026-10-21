@@ -1,0 +1,85 @@
+#!/usr/bin/env php
+<?php
+
+function kingbase_doctor_line($name, $value)
+{
+    echo str_pad($name, 22, ' ') . ': ' . $value . PHP_EOL;
+}
+
+function kingbase_doctor_fail($message, $code)
+{
+    fwrite(STDERR, 'ERROR: ' . $message . PHP_EOL);
+    exit($code);
+}
+
+kingbase_doctor_line('PHP version', PHP_VERSION);
+kingbase_doctor_line('PHP SAPI', PHP_SAPI);
+kingbase_doctor_line('Architecture', PHP_INT_SIZE * 8 . '-bit');
+kingbase_doctor_line('Thread safety', defined('ZEND_THREAD_SAFE') && ZEND_THREAD_SAFE ? 'TS' : 'NTS');
+kingbase_doctor_line('Extension directory', ini_get('extension_dir'));
+kingbase_doctor_line('PDO loaded', extension_loaded('pdo') ? 'yes' : 'no');
+kingbase_doctor_line('PDO_KDB loaded', extension_loaded('pdo_kdb') ? 'yes' : 'no');
+
+if (!extension_loaded('pdo')) {
+    kingbase_doctor_fail('PDO is not loaded', 1);
+}
+if (!extension_loaded('pdo_kdb')) {
+    kingbase_doctor_fail('pdo_kdb is not loaded; install the matching official KingbaseES extension', 1);
+}
+
+$extensionVersion = phpversion('pdo_kdb');
+kingbase_doctor_line('PDO_KDB version', false === $extensionVersion ? 'unknown' : $extensionVersion);
+$drivers = PDO::getAvailableDrivers();
+kingbase_doctor_line('PDO drivers', implode(', ', $drivers));
+if (!in_array('kdb', $drivers, true)) {
+    kingbase_doctor_fail('PDO reports no kdb driver', 1);
+}
+
+$required = array('KDB_PORT', 'KDB_DBNAME', 'KDB_USER', 'KDB_PASSWORD');
+$missing = array();
+foreach ($required as $name) {
+    if (false === getenv($name) || '' === getenv($name)) {
+        $missing[] = $name;
+    }
+}
+if (!empty($missing)) {
+    kingbase_doctor_line('Database connection', 'skipped; set ' . implode(', ', $missing));
+    exit(0);
+}
+
+$host = getenv('KDB_HOST') ?: '127.0.0.1';
+$port = getenv('KDB_PORT');
+$database = getenv('KDB_DBNAME');
+$mode = strtolower(trim((string) getenv('KDB_MODE')));
+if ('sqlsrv' === $mode) {
+    $mode = 'sqlserver';
+}
+if ('' !== $mode && !in_array($mode, array('mysql', 'oracle', 'sqlserver'), true)) {
+    kingbase_doctor_fail('KDB_MODE must be mysql, oracle or sqlserver', 2);
+}
+
+$dsn = 'kdb:host=' . $host . ';dbname=' . $database . ';port=' . $port;
+try {
+    $pdo = new PDO($dsn, getenv('KDB_USER'), getenv('KDB_PASSWORD'), array(
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+    ));
+    $serverMode = strtolower((string) $pdo->query(
+        "SELECT current_setting('database_mode', true)"
+    )->fetchColumn());
+    $schema = (string) $pdo->query('SELECT current_schema()')->fetchColumn();
+} catch (PDOException $exception) {
+    kingbase_doctor_fail(
+        'connection failed for host=' . $host . ', port=' . $port
+        . ', dbname=' . $database . ': ' . $exception->getMessage(),
+        2
+    );
+}
+
+kingbase_doctor_line('Database connection', 'ok');
+kingbase_doctor_line('Server mode', $serverMode);
+kingbase_doctor_line('Current schema', $schema);
+if ('' !== $mode && $serverMode !== $mode) {
+    kingbase_doctor_fail('configured mode ' . $mode . ' does not match server mode ' . $serverMode, 2);
+}
+kingbase_doctor_line('Mode validation', '' === $mode ? 'skipped; KDB_MODE is unset' : 'ok');
+exit(0);
