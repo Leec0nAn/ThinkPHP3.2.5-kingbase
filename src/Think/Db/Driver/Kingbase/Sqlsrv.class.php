@@ -26,7 +26,7 @@ class Sqlsrv implements DialectInterface
      */
     public function getSelectSql()
     {
-        return 'SELECT%DISTINCT% %FIELD% FROM %TABLE%%JOIN%%WHERE%%GROUP%%HAVING%%ORDER%%LIMIT% %UNION%%LOCK%%COMMENT%';
+        return 'SELECT T1.* FROM (SELECT thinkphp.*, ROW_NUMBER() OVER (%ORDER%) AS ROW_NUMBER FROM (SELECT %DISTINCT% %FIELD% FROM %TABLE%%JOIN%%WHERE%%GROUP%%HAVING% %UNION%) AS thinkphp) AS T1 %LIMIT%%COMMENT%';
     }
 
     /**
@@ -38,27 +38,19 @@ class Sqlsrv implements DialectInterface
      */
     public function quoteIdentifier($identifier, $strict = false)
     {
-        if (is_int($identifier)) {
-            return $identifier;
-        }
-
         $identifier = trim($identifier);
         if ($strict && !preg_match('/^[\w\.\*]+$/', $identifier)) {
-            throw new \InvalidArgumentException('Unsupported identifier: ' . $identifier);
+            E('not support data:' . $identifier);
         }
 
-        if ($this->isExpression($identifier)) {
-            return $identifier;
+        // 完整保持原Sqlsrv Driver::parseKey()行为，包括严格模式下将
+        // 限定字段整体放入方括号的既有处理。
+        if ($strict || (!is_numeric($identifier)
+            && !preg_match('/[,\'"\*\(\)\[\.\s]/', $identifier))) {
+            $identifier = '[' . $identifier . ']';
         }
 
-        $parts = explode('.', $identifier);
-        foreach ($parts as &$part) {
-            if ('*' !== $part && !preg_match('/^\[.*\]$/', $part)) {
-                $part = '[' . str_replace(']', ']]', $part) . ']';
-            }
-        }
-        unset($part);
-        return implode('.', $parts);
+        return $identifier;
     }
 
     /**
@@ -73,7 +65,7 @@ class Sqlsrv implements DialectInterface
     }
 
     /**
-     * 将 TP3.2 分页参数转换为 OFFSET/FETCH 子句。
+     * 沿用ThinkPHP 3.2.5 SQL Server Driver的ROW_NUMBER分页范围。
      *
      * @param mixed $limit 分页参数
      * @return string
@@ -84,10 +76,15 @@ class Sqlsrv implements DialectInterface
             return '';
         }
 
-        $parts  = array_map('trim', explode(',', (string) $limit, 2));
-        $offset = count($parts) > 1 ? (int) $parts[0] : 0;
-        $count  = count($parts) > 1 ? (int) $parts[1] : (int) $parts[0];
-        return ' OFFSET ' . $offset . ' ROWS FETCH NEXT ' . $count . ' ROWS ONLY ';
+        $parts = array_map('trim', explode(',', (string) $limit, 2));
+        if (count($parts) > 1) {
+            $limitStr = '(T1.ROW_NUMBER BETWEEN ' . (int) $parts[0]
+                . ' + 1 AND ' . (int) $parts[0] . ' + ' . (int) $parts[1] . ')';
+        } else {
+            $limitStr = '(T1.ROW_NUMBER BETWEEN 1 AND ' . (int) $parts[0] . ')';
+        }
+
+        return 'WHERE ' . $limitStr;
     }
 
     /**
@@ -104,26 +101,13 @@ class Sqlsrv implements DialectInterface
     }
 
     /**
-     * 返回 SQL Server 风格的随机排序函数。
+     * 保持 ThinkPHP 3.2.5 原 Sqlsrv Driver 的随机排序表达式。
      *
      * @return string
      */
     public function parseRand()
     {
-        return 'NEWID()';
+        return 'rand()';
     }
 
-    /**
-     * 判断输入是否已是 SQL 表达式，避免重复添加方括号。
-     *
-     * @param mixed $identifier 标识符或表达式
-     * @return boolean
-     */
-    private function isExpression($identifier)
-    {
-        return '' === $identifier
-            || '*' === $identifier
-            || preg_match('/[,\'"`()\s]/', $identifier)
-            || false !== strpos($identifier, '[');
-    }
 }

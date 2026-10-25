@@ -31,7 +31,6 @@ class Kingbase extends Driver
     protected $schema = '';
     protected $schemaConfigured = false;
     protected $initializedLinks = array();
-    protected $metadataCache = array();
     protected $pendingSequence = null;
     protected $pendingLobFields = array();
     protected $generatedKeyContextPrepared = false;
@@ -254,7 +253,7 @@ class Kingbase extends Driver
     }
 
     /**
-     * 读取并缓存指定表的 TP3.2 字段元数据。
+     * 读取指定表的 TP3.2 字段元数据。
      *
      * @param string $tableName 表名或 Schema 限定表名
      * @return array
@@ -262,11 +261,7 @@ class Kingbase extends Driver
     public function getFields($tableName)
     {
         $this->ensureMetadata();
-        $cacheKey = strtolower($this->schema . '.' . $tableName);
-        if (!isset($this->metadataCache[$cacheKey])) {
-            $this->metadataCache[$cacheKey] = $this->metadata->getFields($this, $tableName);
-        }
-        return $this->metadataCache[$cacheKey];
+        return $this->metadata->getFields($this, $tableName);
     }
 
     /**
@@ -302,6 +297,22 @@ class Kingbase extends Driver
     public function parseLimit($limit)
     {
         return $this->dialect->parseLimit($limit);
+    }
+
+    /**
+     * SQL Server原Driver使用ROW_NUMBER分页，即使业务未指定排序也需要一个ORDER BY。
+     * 其他兼容模式继续使用原Driver的排序解析逻辑。
+     *
+     * @param mixed $order 排序配置
+     * @return string
+     */
+    protected function parseOrder($order)
+    {
+        if ('sqlserver' === $this->mode && empty($order)) {
+            return ' ORDER BY ' . $this->dialect->parseRand();
+        }
+
+        return parent::parseOrder($order);
     }
 
     /**
@@ -376,7 +387,7 @@ class Kingbase extends Driver
      * 插入单行数据，并在进入 TP3.2 公共 INSERT 构造流程前完成三模式适配。
      *
      * Oracle 模式按配置注入序列 NEXTVAL，MySQL 模式处理二进制字面量，所有模式
-     * 自动识别 LOB 字段；REPLACE 仅允许在 MySQL 兼容模式使用。
+     * 自动识别 LOB 字段；REPLACE 沿用原 Driver 的生成规则。
      *
      * @param array   $data    待写入数据
      * @param array   $options TP3.2 查询选项
@@ -386,9 +397,6 @@ class Kingbase extends Driver
     public function insert($data, $options = array(), $replace = false)
     {
         $this->resetGeneratedKeyContext();
-        if ('mysql' !== $this->mode && $replace) {
-            E('REPLACE is only supported by the KES MySQL compatibility mode');
-        }
         if ('oracle' === $this->mode && empty($options['fetch_sql'])) {
             $data = $this->prepareOracleInsert($data, $options);
         } elseif ('mysql' === $this->mode && empty($options['fetch_sql'])) {
@@ -408,8 +416,9 @@ class Kingbase extends Driver
     /**
      * 使用标准 VALUES 语法批量插入多行数据。
      *
-     * KingbaseES SQL Server 模式无法稳定推断 UNION ALL 中的占位符类型，因此三种
-     * 模式统一生成 INSERT ... VALUES (...), (...)；同时执行序列、二进制和 LOB 适配。
+     * PDO_KDB在KingbaseES Oracle和SQL Server模式下无法稳定推断UNION ALL中的
+     * 占位符类型，因此三种模式统一生成INSERT ... VALUES (...), (...)；同时执行
+     * 序列、二进制和LOB适配。
      *
      * @param array   $dataSet 多行数据
      * @param array   $options TP3.2 查询选项
@@ -422,11 +431,6 @@ class Kingbase extends Driver
         if (empty($dataSet)) {
             return false;
         }
-        $dataSet = $this->normalizeInsertRows($dataSet);
-        if ('mysql' !== $this->mode && $replace) {
-            E('REPLACE is only supported by the KES MySQL compatibility mode');
-        }
-
         if ('oracle' === $this->mode && empty($options['fetch_sql'])) {
             foreach ($dataSet as $index => $data) {
                 $dataSet[$index] = $this->prepareOracleInsert($data, $options);
@@ -463,7 +467,12 @@ class Kingbase extends Driver
                 $values[] = '(' . implode(',', $row) . ')';
             }
 
-            $verb = true === $replace || (is_numeric($replace) && $replace > 0) ? 'REPLACE' : 'INSERT';
+            // 原 Mysql Driver 支持批量 REPLACE；Oracle 与 Sqlsrv 继承的基础 Driver
+            // 对批量写入始终生成 INSERT。适配层保持这一原有差异。
+            $verb = 'mysql' === $this->mode
+                && (true === $replace || (is_numeric($replace) && $replace > 0))
+                ? 'REPLACE'
+                : 'INSERT';
             $sql  = $verb . ' INTO ' . $this->parseTable($options['table'])
                 . ' (' . implode(',', $fields) . ') VALUES ' . implode(',', $values);
             $sql .= $this->parseComment(!empty($options['comment']) ? $options['comment'] : '');
@@ -474,52 +483,10 @@ class Kingbase extends Driver
     }
 
     /**
-     * 在连接、序列处理和参数绑定之前校验批量数据，并统一每行的字段顺序。
-     *
-     * 保留 NULL、SQL 表达式及命名绑定值；拒绝字段缺失、额外字段和非法值，
-     * 防止 INSERT 列名与 VALUES 的位置错配。外层数组不要求从零连续编号。
-     *
-     * @param array $rows 待插入的数据行
-     * @return array 按首行字段顺序排列的数据
-     * @throws \InvalidArgumentException 数据行或字段集合无效
-     */
-    private function normalizeInsertRows($rows)
-    {
-        if (!is_array($rows)) {
-            throw new \InvalidArgumentException('Batch insert requires an array of rows');
-        }
-        $first = reset($rows);
-        if (!is_array($first) || empty($first)) {
-            throw new \InvalidArgumentException('Batch insert requires non-empty rows');
-        }
-        $keys = array_keys($first);
-        $normalized = array();
-        foreach ($rows as $row) {
-            if (!is_array($row) || count($row) !== count($keys)
-                || array_diff_key($first, $row) || array_diff_key($row, $first)) {
-                throw new \InvalidArgumentException('Batch insert rows must have the same fields');
-            }
-            $ordered = array();
-            foreach ($keys as $key) {
-                $value = $row[$key];
-                if (!is_null($value) && !is_scalar($value)
-                    && !(is_array($value) && isset($value[0], $value[1])
-                        && is_string($value[0]) && 'exp' === strtolower($value[0])
-                        && is_scalar($value[1]))) {
-                    throw new \InvalidArgumentException('Unsupported batch insert value');
-                }
-                $ordered[$key] = $value;
-            }
-            $normalized[] = $ordered;
-        }
-        return $normalized;
-    }
-
-    /**
      * 预处理并执行写 SQL，避免 TP3.2 父驱动无条件调用 lastInsertId()。
      *
-     * 本方法负责参数绑定、影响行数、DDL 后元数据缓存失效、三模式插入主键回读和
-     * 详细测试日志；fetchSql 为真时仅返回插值后的调试 SQL，不访问数据库。
+     * 本方法负责参数绑定、影响行数、三模式插入主键回读和详细测试日志；fetchSql
+     * 为真时仅返回插值后的调试 SQL，不访问数据库。
      *
      * @param string  $str      SQL 语句
      * @param boolean $fetchSql 是否只返回构造后的 SQL
@@ -575,11 +542,6 @@ class Kingbase extends Driver
                 return false;
             }
             $this->numRows = $this->PDOStatement->rowCount();
-            if (preg_match('/^\s*(?:CREATE|ALTER|DROP|TRUNCATE|COMMENT)\b/i', $str)) {
-                // A long-lived Model/driver instance must not keep field
-                // definitions from before a successful schema change.
-                $this->metadataCache = array();
-            }
             if (preg_match('/^\s*INSERT\s+INTO\s+/i', $str)) {
                 $this->captureLastInsertId($str);
             } else {
@@ -692,10 +654,10 @@ class Kingbase extends Driver
     }
 
     /**
-     * 更新符合条件的数据，并适配非 MySQL 模式的语句尾部能力。
+     * 按原Driver行为更新数据，同时保留PDO_KDB的LOB绑定处理。
      *
-     * MySQL 模式沿用父实现；Oracle 和 SQL Server 模式不支持写操作的 ORDER/LIMIT，
-     * 必须在执行前明确拒绝，避免静默扩大写入范围。保留绑定、LOB 和 fetch_sql。
+     * MySQL和Oracle沿用基础Driver；SQL Server复现原Sqlsrv Driver忽略
+     * ORDER/LIMIT并保留LOCK、COMMENT的行为。
      *
      * @param array $data    更新数据
      * @param array $options TP3.2 查询选项
@@ -703,10 +665,9 @@ class Kingbase extends Driver
      */
     public function update($data, $options)
     {
-        $this->validateWriteOptions($options);
         $this->pendingLobFields = $this->detectLobFields($data, $options);
         try {
-            if ('mysql' === $this->mode) {
+            if ('sqlserver' !== $this->mode) {
                 return parent::update($data, $options);
             }
             $this->model = $options['model'];
@@ -714,6 +675,7 @@ class Kingbase extends Driver
             $sql = 'UPDATE ' . $this->parseTable($options['table'])
                 . $this->parseSet($data)
                 . $this->parseWhere(!empty($options['where']) ? $options['where'] : '')
+                . $this->parseLock(isset($options['lock']) ? $options['lock'] : false)
                 . $this->parseComment(!empty($options['comment']) ? $options['comment'] : '');
             return $this->execute($sql, !empty($options['fetch_sql']));
         } finally {
@@ -722,50 +684,30 @@ class Kingbase extends Driver
     }
 
     /**
-     * 删除符合条件的数据；非 MySQL 模式明确拒绝不支持的 ORDER/LIMIT 选项。
+     * 按原Driver行为删除数据。
+     *
+     * MySQL和Oracle沿用基础Driver；SQL Server复现原Sqlsrv Driver忽略
+     * ORDER/LIMIT并保留LOCK、COMMENT的行为。
      *
      * @param array $options TP3.2 查询选项
      * @return mixed
      */
     public function delete($options = array())
     {
-        $this->validateWriteOptions($options);
-        if ('mysql' === $this->mode) {
+        if ('sqlserver' !== $this->mode) {
             return parent::delete($options);
         }
         $this->model = $options['model'];
         $this->parseBind(!empty($options['bind']) ? $options['bind'] : array());
         $sql = 'DELETE FROM ' . $this->parseTable($options['table'])
             . $this->parseWhere(!empty($options['where']) ? $options['where'] : '')
+            . $this->parseLock(isset($options['lock']) ? $options['lock'] : false)
             . $this->parseComment(!empty($options['comment']) ? $options['comment'] : '');
         return $this->execute($sql, !empty($options['fetch_sql']));
     }
 
     /**
-     * 拒绝无法保留语义的非 MySQL 限量/排序写操作；LIMIT 0 也不能被当成空值。
-     *
-     * @param array $options TP3.2 写操作选项
-     * @return void
-     * @throws \InvalidArgumentException 使用不受支持的 ORDER 或 LIMIT
-     */
-    private function validateWriteOptions($options)
-    {
-        if ('mysql' === $this->mode) {
-            return;
-        }
-        foreach (array('order', 'limit') as $key) {
-            if (isset($options[$key]) && '' !== $options[$key]
-                && false !== $options[$key] && array() !== $options[$key]) {
-                throw new \InvalidArgumentException(
-                    'KES ' . $this->mode . ' UPDATE/DELETE does not support ' . strtoupper($key)
-                    . '; no SQL was executed. Select target primary keys explicitly before writing.'
-                );
-            }
-        }
-    }
-
-    /**
-     * 关闭全部连接并清理事务、Schema 推断和元数据缓存状态。
+     * 关闭全部连接并清理事务和 Schema 推断状态。
      *
      * @return void
      */
@@ -776,7 +718,6 @@ class Kingbase extends Driver
         $this->initializedLinks = array();
         $this->transPDO         = null;
         $this->transTimes       = 0;
-        $this->metadataCache    = array();
         if (!$this->schemaConfigured) {
             $this->schema   = '';
             $this->metadata = null;
@@ -1267,8 +1208,6 @@ class Kingbase extends Driver
         $placeholder = '(:[A-Za-z_][A-Za-z0-9_]*)';
         $patterns = array(
             '/\bFIND_IN_SET\s*\(\s*' . $placeholder . '/i',
-            '/\bREGEXP_LIKE\s*\([^,]+,\s*' . $placeholder . '/i',
-            '/\bREGEXP\s+' . $placeholder . '/i',
         );
         $replacements = array();
         foreach ($patterns as $pattern) {

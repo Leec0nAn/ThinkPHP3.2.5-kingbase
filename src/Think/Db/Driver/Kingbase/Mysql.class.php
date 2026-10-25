@@ -44,21 +44,16 @@ class Mysql implements DialectInterface
 
         $identifier = trim($identifier);
         if ($strict && !preg_match('/^[\w\.\*]+$/', $identifier)) {
-            throw new \InvalidArgumentException('Unsupported identifier: ' . $identifier);
+            E('not support data:' . $identifier);
         }
 
-        if ($this->isExpression($identifier)) {
-            return $identifier;
+        // 与原Mysql Driver::parseKey()保持一致：仅引用简单标识符，
+        // 限定字段、函数和表达式保持原样。
+        if ('*' !== $identifier && !preg_match('/[,\'"\*\(\)`\.\s]/', $identifier)) {
+            $identifier = '`' . $identifier . '`';
         }
 
-        $parts = explode('.', $identifier);
-        foreach ($parts as &$part) {
-            if ('*' !== $part && !preg_match('/^`.*`$/', $part)) {
-                $part = '`' . str_replace('`', '``', $part) . '`';
-            }
-        }
-        unset($part);
-        return implode('.', $parts);
+        return $identifier;
     }
 
     /**
@@ -73,21 +68,16 @@ class Mysql implements DialectInterface
     }
 
     /**
-     * 将 TP3.2 的“偏移量,数量”转换成 LIMIT/OFFSET 分页子句。
+     * 保留ThinkPHP 3.2.5原MySQL Driver的LIMIT offset,count分页语法。
      *
      * @param mixed $limit 分页参数
      * @return string
      */
     public function parseLimit($limit)
     {
-        if ('' === (string) $limit) {
-            return '';
-        }
-
-        $parts  = array_map('trim', explode(',', (string) $limit, 2));
-        $offset = count($parts) > 1 ? (int) $parts[0] : 0;
-        $count  = count($parts) > 1 ? (int) $parts[1] : (int) $parts[0];
-        return ' LIMIT ' . $count . ($offset > 0 ? ' OFFSET ' . $offset : '') . ' ';
+        return (!empty($limit) && false === strpos($limit, '('))
+            ? ' LIMIT ' . $limit . ' '
+            : '';
     }
 
     /**
@@ -111,17 +101,4 @@ class Mysql implements DialectInterface
         return 'rand()';
     }
 
-    /**
-     * 判断输入是否已经是 SQL 表达式，避免对其再次添加反引号。
-     *
-     * @param mixed $identifier 标识符或表达式
-     * @return boolean
-     */
-    private function isExpression($identifier)
-    {
-        return '' === $identifier
-            || '*' === $identifier
-            || preg_match('/[,\'"()\s]/', $identifier)
-            || false !== strpos($identifier, '`');
-    }
 }

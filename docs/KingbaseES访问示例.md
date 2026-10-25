@@ -99,7 +99,7 @@ $affected = M('User')
     ->delete();
 ```
 
-删除和更新操作应提供明确条件。当前兼容模式无法保持带`ORDER BY`或`LIMIT`写操作的原调用语义时，驱动会拒绝执行，避免扩大数据修改范围。
+删除和更新操作必须提供明确条件。为保持ThinkPHP 3.2.5原Driver行为，Oracle模式会按原基础Driver生成带`order()`或`limit()`选项的写入SQL，该SQL可能由数据库返回语法错误；SQL Server模式会沿用原Sqlsrv Driver并忽略写操作中的`order()`和`limit()`，实际修改范围仍由`where()`条件决定。需要限制写入数量时，应先查询目标记录主键，再使用明确的主键条件执行更新或删除。
 
 ## 5. Oracle兼容模式使用Sequence新增主键
 
